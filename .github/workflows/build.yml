@@ -42,6 +42,17 @@ jobs:
             -o "$RUNNER_TEMP/products.csv.gz" "$OFF_EXPORT_URL"
           ls -lh "$RUNNER_TEMP/products.csv.gz"
 
+      - name: Work out the safety floor
+        # Refuse to publish if the pack shrinks by more than 20% since last
+        # week (a broken export, a renamed column), with an absolute floor too.
+        run: |
+          PREV=$(curl -sfL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/manifest.json" \
+                 | jq -r '.product_count // 0' || echo 0)
+          MIN=$(( PREV * 80 / 100 ))
+          if [ "$MIN" -lt 20000 ]; then MIN=20000; fi
+          echo "previous: $PREV, minimum this run: $MIN"
+          echo "MIN_PRODUCTS=$MIN" >> "$GITHUB_ENV"
+
       - name: Build and sign pack
         env:
           SIGNING_KEY: ${{ secrets.FOOD_PACK_SIGNING_KEY }}
@@ -51,6 +62,7 @@ jobs:
           python scripts/build_pack.py \
             --input "$RUNNER_TEMP/products.csv.gz" \
             --out dist \
+            --min-products "$MIN_PRODUCTS" \
             --sign-key "$RUNNER_TEMP/key.pem"
           rm -f "$RUNNER_TEMP/key.pem"
           openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin \

@@ -32,7 +32,7 @@ PACK_NAME = "uk-food-pack.sqlite.deflate"
 UK_TAG = "en:united-kingdom"
 SOURCE = "Open Food Facts (https://world.openfoodfacts.org)"
 LICENCE = "ODbL 1.0 (https://opendatacommons.org/licenses/odbl/1-0/)"
-MIN_PRODUCTS = 50_000  # refuse to publish a suspiciously small pack
+MIN_PRODUCTS = 20_000  # absolute floor; the workflow also checks against last week
 
 # Filtering and sanity checks run in DuckDB, straight off the compressed CSV.
 # Values that can't be real (over 900 kcal per 100 g, negative numbers,
