@@ -35,8 +35,10 @@ LICENCE = "ODbL 1.0 (https://opendatacommons.org/licenses/odbl/1-0/)"
 MIN_PRODUCTS = 20_000  # absolute floor; the workflow also checks against last week
 
 # Filtering and sanity checks run in DuckDB, straight off the compressed CSV.
-# Values that can't be real (over 900 kcal per 100 g, negative numbers,
-# macros adding up to more than 100 g) drop the product rather than guess.
+# A product is kept if it has a valid barcode and a name, so a scan can at
+# least recognise it. Nutrition is kept only when it's plausible: values that
+# can't be real (over 900 kcal per 100 g, negatives, macros adding up to more
+# than 100 g) blank the nutrition rather than drop the product or guess.
 QUERY = r"""
 WITH raw AS (
   SELECT
@@ -46,7 +48,9 @@ WITH raw AS (
     nullif(trim(quantity), '')                   AS quantity,
     nullif(trim(serving_size), '')               AS serving_size,
     try_cast(serving_quantity AS DOUBLE)         AS serving_g,
-    try_cast("energy-kcal_100g" AS DOUBLE)       AS kcal,
+    coalesce(
+      try_cast("energy-kcal_100g" AS DOUBLE),
+      try_cast("energy-kj_100g" AS DOUBLE) / 4.184) AS kcal,
     try_cast(proteins_100g AS DOUBLE)            AS protein,
     try_cast(carbohydrates_100g AS DOUBLE)       AS carbs,
     try_cast(sugars_100g AS DOUBLE)              AS sugar,
@@ -59,11 +63,14 @@ WITH raw AS (
     ignore_errors = true, max_line_size = 10000000)
   WHERE countries_tags LIKE '%' || $uk || '%'
 ),
-clean AS (
+named AS (
   SELECT * FROM raw
   WHERE regexp_full_match(barcode, '[0-9]{8,14}')
     AND name IS NOT NULL AND length(name) BETWEEN 2 AND 200
-    AND kcal IS NOT NULL AND kcal BETWEEN 0 AND 900
+),
+checked AS (
+  SELECT *,
+    kcal IS NOT NULL AND kcal BETWEEN 0 AND 900
     AND coalesce(protein, 0) BETWEEN 0 AND 100
     AND coalesce(carbs, 0)   BETWEEN 0 AND 100
     AND coalesce(sugar, 0)   BETWEEN 0 AND 100
@@ -71,17 +78,24 @@ clean AS (
     AND coalesce(fibre, 0)   BETWEEN 0 AND 100
     AND coalesce(salt, 0)    BETWEEN 0 AND 100
     AND coalesce(protein, 0) + coalesce(carbs, 0) + coalesce(fat, 0) <= 105
-    AND (sugar IS NULL OR carbs IS NULL OR sugar <= carbs + 1)
-    AND (serving_g IS NULL OR serving_g BETWEEN 0 AND 5000)
+    AND (sugar IS NULL OR carbs IS NULL OR sugar <= carbs + 1) AS ok
+  FROM named
 ),
 latest AS (
   SELECT *, row_number() OVER (
     PARTITION BY barcode ORDER BY updated_at DESC NULLS LAST) AS rn
-  FROM clean
+  FROM checked
 )
 SELECT barcode, name, brand, quantity, serving_size,
-       round(serving_g, 1), round(kcal, 1), round(protein, 2), round(carbs, 2),
-       round(sugar, 2), round(fat, 2), round(fibre, 2), round(salt, 3),
+       CASE WHEN serving_g BETWEEN 0 AND 5000 THEN round(serving_g, 1) END,
+       CASE WHEN ok THEN 1 ELSE 0 END,
+       CASE WHEN ok THEN round(kcal, 1) END,
+       CASE WHEN ok THEN round(protein, 2) END,
+       CASE WHEN ok THEN round(carbs, 2) END,
+       CASE WHEN ok THEN round(sugar, 2) END,
+       CASE WHEN ok THEN round(fat, 2) END,
+       CASE WHEN ok THEN round(fibre, 2) END,
+       CASE WHEN ok THEN round(salt, 3) END,
        updated_at
 FROM latest WHERE rn = 1
 ORDER BY barcode
@@ -99,7 +113,8 @@ CREATE TABLE products (
   quantity     TEXT,
   serving_size TEXT,
   serving_g    REAL,
-  kcal         REAL NOT NULL,
+  has_nutrition INTEGER NOT NULL,  -- 1 if the per-100 g values below are usable
+  kcal         REAL,
   protein      REAL,
   carbs        REAL,
   sugar        REAL,
@@ -117,14 +132,15 @@ CREATE VIRTUAL TABLE products_fts USING fts5(
 """
 
 
-def build_sqlite(input_path: str, db_path: Path, version: str) -> int:
+def build_sqlite(input_path: str, db_path: Path, version: str) -> tuple[int, int]:
     rows = duckdb.execute(QUERY, {"input": input_path, "uk": UK_TAG}).fetchall()
     con = sqlite3.connect(db_path)
     con.executescript(SCHEMA)
     con.executemany(
         "INSERT INTO products (barcode, name, brand, quantity, serving_size,"
-        " serving_g, kcal, protein, carbs, sugar, fat, fibre, salt, updated_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " serving_g, has_nutrition, kcal, protein, carbs, sugar, fat, fibre,"
+        " salt, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     con.execute("INSERT INTO products_fts(products_fts) VALUES ('rebuild')")
@@ -135,6 +151,7 @@ def build_sqlite(input_path: str, db_path: Path, version: str) -> int:
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "country": "GB",
         "product_count": str(len(rows)),
+        "products_with_nutrition": str(sum(r[6] for r in rows)),
         "source": SOURCE,
         "licence": LICENCE,
     }
@@ -146,7 +163,7 @@ def build_sqlite(input_path: str, db_path: Path, version: str) -> int:
     con.close()
     if ok != "ok":
         sys.exit(f"integrity check failed: {ok}")
-    return len(rows)
+    return len(rows), sum(r[6] for r in rows)
 
 
 def deflate(src: Path, dst: Path) -> None:
@@ -180,10 +197,12 @@ def main() -> None:
     db = args.out / "uk-food-pack.sqlite"
     db.unlink(missing_ok=True)
 
-    count = build_sqlite(args.input, db, version)
-    print(f"products: {count}")
+    count, with_nutrition = build_sqlite(args.input, db, version)
+    print(f"products: {count}, with nutrition: {with_nutrition}")
     if count < args.min_products:
         sys.exit(f"only {count} products, below {args.min_products}; not publishing")
+    if with_nutrition < count // 2:
+        sys.exit(f"only {with_nutrition} of {count} products have nutrition; not publishing")
 
     pack = args.out / PACK_NAME
     deflate(db, pack)
@@ -194,6 +213,7 @@ def main() -> None:
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "country": "GB",
         "product_count": count,
+        "products_with_nutrition": with_nutrition,
         "file": PACK_NAME,
         "compression": "deflate-raw",
         "size": len(data),

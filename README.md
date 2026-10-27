@@ -9,9 +9,11 @@ food search on the phone with no signal.
 Every Monday a GitHub Actions job:
 
 1. Downloads Open Food Facts' nightly products export.
-2. Keeps products sold in the UK that have a barcode, a name and plausible
-   nutrition data. Anything impossible (over 900 kcal per 100 g, negative
-   values, macros adding up to more than 100 g) is dropped, not guessed.
+2. Keeps every product sold in the UK that has a valid barcode and a name, so
+   a scan can at least recognise it. Nutrition is included where it's
+   plausible; anything impossible (over 900 kcal per 100 g, negative values,
+   macros adding up to more than 100 g) is blanked, not guessed. Energy given
+   only in kJ is converted to kcal.
 3. Writes a SQLite database with a full-text search index on name and brand.
 4. Compresses it (raw DEFLATE), signs it with Ed25519 and publishes it as a
    release alongside `manifest.json`. The last four releases are kept.
@@ -35,8 +37,9 @@ Then inflate it (raw DEFLATE, no zlib header) and open it read-only.
 ### Schema (version 1)
 
 - `products`: `barcode` (unique), `name`, `brand`, `quantity`, `serving_size`,
-  `serving_g`, and per 100 g `kcal`, `protein`, `carbs`, `sugar`, `fat`,
-  `fibre`, `salt` (all grams except kcal), plus `updated_at` (Unix time)
+  `serving_g`, `has_nutrition` (1 or 0), and per 100 g `kcal`, `protein`,
+  `carbs`, `sugar`, `fat`, `fibre`, `salt` (all grams except kcal; all null
+  when `has_nutrition` is 0), plus `updated_at` (Unix time)
 - `products_fts`: FTS5 index on `name` and `brand`, accent-insensitive, with
   prefix indexes for search-as-you-type
 - `meta`: key/value build details, including `pack_version` and `product_count`
