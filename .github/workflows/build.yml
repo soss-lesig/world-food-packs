@@ -1,0 +1,85 @@
+name: Build UK food pack
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays, 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # create releases
+  actions: write  # keep the schedule from being switched off after 60 quiet days
+
+concurrency:
+  group: build-pack
+  cancel-in-progress: false
+
+env:
+  OFF_EXPORT_URL: https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz
+  KEEP_RELEASES: 4
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download Open Food Facts export
+        run: |
+          curl --fail --location --retry 3 --retry-delay 30 \
+            --user-agent "uk-food-pack (github.com/${GITHUB_REPOSITORY})" \
+            -o "$RUNNER_TEMP/products.csv.gz" "$OFF_EXPORT_URL"
+          ls -lh "$RUNNER_TEMP/products.csv.gz"
+
+      - name: Build and sign pack
+        env:
+          SIGNING_KEY: ${{ secrets.FOOD_PACK_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
+          python scripts/build_pack.py \
+            --input "$RUNNER_TEMP/products.csv.gz" \
+            --out dist \
+            --sign-key "$RUNNER_TEMP/key.pem"
+          rm -f "$RUNNER_TEMP/key.pem"
+          openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin \
+            -in dist/uk-food-pack.sqlite.deflate \
+            -sigfile <(jq -r .signature dist/manifest.json | base64 -d)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(jq -r .version dist/manifest.json)
+          COUNT=$(jq -r .product_count dist/manifest.json)
+          TAG="pack-${VERSION}"
+          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            dist/uk-food-pack.sqlite.deflate dist/manifest.json \
+            --title "UK food pack ${VERSION}" \
+            --notes "${COUNT} UK products from Open Food Facts, available under the ODbL 1.0." \
+            --latest
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("pack-"))] | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' \
+          | while read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done
+
+      - name: Keep schedule alive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
