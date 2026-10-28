@@ -39,6 +39,8 @@ import tempfile
 import zlib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 SCHEMA_VERSION = 3
 SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -79,6 +81,28 @@ VALUE_RULES = {
     "macros add up": "coalesce(protein, 0) + coalesce(carbs, 0) + coalesce(fat, 0) > 105.05",
     "scans": "scans < 0",
 }
+
+
+def normalise_sql(sql: str) -> str:
+    """A table's CREATE statement without comments or layout, for comparing exactly."""
+    no_comments = re.sub(r"--[^\n]*", "", sql)
+    return " ".join(no_comments.replace("(", " ( ").replace(")", " ) ").replace(",", " , ").split()).lower()
+
+
+_EXPECTED_SQL: dict[str, str] | None = None
+
+
+def expected_sql() -> dict[str, str]:
+    """Every table's CREATE statement as build_packs.py makes it (FTS5 writes its own shadow tables)."""
+    global _EXPECTED_SQL
+    if _EXPECTED_SQL is None:
+        import build_schema
+
+        con = sqlite3.connect(":memory:")
+        con.executescript(build_schema.SCHEMA)
+        _EXPECTED_SQL = {n: normalise_sql(s) for n, s in con.execute("SELECT name, sql FROM sqlite_schema") if s}
+        con.close()
+    return _EXPECTED_SQL
 
 
 def sha256(path: Path) -> str:
@@ -145,7 +169,11 @@ def inflate(src: Path, dst: Path, expected: int) -> bool:
                 if not d.unconsumed_tail:
                     break
                 data = d.decompress(d.unconsumed_tail, expected - written + 1)
-        written += len(d.flush())
+        tail = d.flush()
+        written += len(tail)
+        if written > expected:
+            return False
+        fout.write(tail)
     return d.eof and written == expected
 
 
@@ -165,9 +193,13 @@ def check_pack(p: dict, dist: Path) -> list[str]:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
             con.execute("PRAGMA trusted_schema = OFF")
-            objects = set(con.execute("SELECT type, name FROM sqlite_schema").fetchall())
+            rows = con.execute("SELECT type, name, sql FROM sqlite_schema").fetchall()
+            objects = {(t, n) for t, n, _ in rows}
             if objects != EXPECTED_OBJECTS:
                 return [f"{c} has unexpected database objects: {sorted(objects ^ EXPECTED_OBJECTS)}"]
+            sql = {n: normalise_sql(s) for _, n, s in rows if s}
+            if sql != expected_sql():
+                return [f"{c} has tables that aren't defined exactly as the build defines them"]
             problems = []
             if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 problems.append(f"{c} fails SQLite's integrity check")

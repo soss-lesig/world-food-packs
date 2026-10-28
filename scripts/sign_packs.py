@@ -8,6 +8,10 @@ index's shape, that every country is a plain slug, that dist holds exactly the
 listed files, and every file's size and SHA-256, so it signs exactly what was
 verified and nothing else.
 
+With --expect-index-sha256 (always, in the workflow) it first checks the index is
+byte for byte the one the verify job passed. The index pins every pack's hash, so
+nothing swapped in between verify and sign can be signed.
+
 Writes index.json and its detached signature (index.json.sig) to --out. The
 packs themselves aren't changed; each pack's signature goes in the index.
 
@@ -44,9 +48,12 @@ def main() -> None:
     ap.add_argument("--dist", required=True, type=Path)
     ap.add_argument("--key", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--expect-index-sha256", help="SHA-256 of the index the verify job passed")
     args = ap.parse_args()
 
     index_path = args.dist / "index.unsigned.json"
+    if args.expect_index_sha256 is not None and sha256(index_path) != args.expect_index_sha256.strip().lower():
+        sys.exit("Not signing: the index isn't the one that was verified")
     index = json.loads(index_path.read_text())
     problems = shape(index)
     if not problems:

@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import unicodedata
@@ -45,6 +46,7 @@ NUTRIENTS = {
     "fat": "fat_100g",
     "fibre": "fiber_100g",
     "salt": "salt_100g",
+    "alcohol": "alcohol_100g",  # % vol
 }
 
 
@@ -187,9 +189,11 @@ NEW_NAMES = {
     "fat": "fat",
     "fibre": "fiber",
     "salt": "salt",
+    "alcohol": "alcohol",
 }
 MASS = {"g": 1.0, "mg": 0.001, "µg": 0.000001, "μg": 0.000001, "mcg": 0.000001}
-UNITS = {"kcal": {"kcal": 1.0}, "kj": {"kj": 1.0}}  # energy in its own unit only; everything else is a mass
+# Energy in its own unit only, alcohol in % vol; everything else is a mass.
+UNITS = {"kcal": {"kcal": 1.0}, "kj": {"kj": 1.0}, "alcohol": {"% vol": 1.0, "%vol": 1.0, "%": 1.0, "": 1.0}}
 
 
 def factor_for(field: str, unit) -> float | None:
@@ -262,8 +266,19 @@ def slim(raw: bytes) -> dict | None:
     else:
         for field, key in NUTRIENTS.items():
             out[field] = number(nut.get(key)) if hasattr(nut, "get") else None
-        out["per"] = "100ml" if doc.get("nutrition_data_per") == "100ml" else "100g"
+        out["per"] = "100ml" if doc.get("nutrition_data_per") == "100ml" or is_liquid(doc) else "100g"
     return out
+
+
+LIQUID = re.compile(r"\d\s*(ml|cl|dl|l|litres?|liters?|fl\.? ?oz)\b", re.IGNORECASE)
+
+
+def is_liquid(doc) -> bool:
+    """Old-style products don't say per 100 ml, but a pack sold in ml or litres is labelled per 100 ml."""
+    if str(doc.get("serving_quantity_unit") or "").lower() == "ml":
+        return True
+    quantity = doc.get("quantity")
+    return isinstance(quantity, str) and bool(LIQUID.search(quantity)) and not re.search(r"\d\s*(g|kg)\b", quantity, re.IGNORECASE)
 
 
 def main() -> None:

@@ -70,6 +70,55 @@ class ExtractTests(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["bad.gz"])
 
 
+class BuildTests(unittest.TestCase):
+    """A tiny slim file through the real build query."""
+
+    ROWS = [
+        dict(code="5000000000011", name="Yoghurt", countries=["en:united-kingdom"], kcal=60, kj=251, protein=4, carbs=6, fat=3),
+        # kJ typed into the kcal box: 251 kcal against macros adding up to 67.
+        dict(code="5000000000012", name="Yoghurt slip", countries=["en:united-kingdom"], kcal=251, protein=4, carbs=6, fat=3),
+        # kcal typed into the kJ box, no kcal: 60 / 4.184 = 14 kcal against macros of 67.
+        dict(code="5000000000013", name="Yoghurt slip two", countries=["en:united-kingdom"], kj=60, protein=4, carbs=6, fat=3),
+        # Wine: almost no macros, the energy is alcohol.
+        dict(code="5000000000014", name="Red wine", countries=["en:united-kingdom"], kcal=85, protein=0.1, carbs=2.6, fat=0, alcohol=13, per="100ml"),
+        dict(code="5000000000015", name="Old tag", countries=["en:world", "en:yugoslavia", "en:united-kingdom", "en:united-kingdom"], kcal=100, protein=1, carbs=20, fat=1),
+    ]
+
+    def test_build_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            with (t / "slim.jsonl").open("w") as f:
+                for r in self.ROWS:
+                    f.write(json.dumps({"scans": 1, "updated_at": 1, "obsolete": False, **r}) + "\n")
+            r = subprocess.run([sys.executable, "-I", "scripts/build_packs.py", "--slim", str(t / "slim.jsonl"),
+                                "--source-sha256", "0" * 64, "--out", str(t / "dist"), "--min-per-country", "1"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            files = sorted(p.name for p in (t / "dist").iterdir())
+            self.assertEqual(files, ["index.unsigned.json", "united-kingdom.sqlite.deflate"], "No world or yugoslavia packs")
+            db = t / "uk.sqlite"
+            db.write_bytes(zlib.decompress((t / "dist/united-kingdom.sqlite.deflate").read_bytes(), -15))
+            con = sqlite3.connect(db)
+            got = dict(con.execute("SELECT name, has_nutrition FROM products").fetchall())
+            per_ml = dict(con.execute("SELECT name, per_ml FROM products").fetchall())
+            con.close()
+            self.assertEqual(got, {"Yoghurt": 1, "Yoghurt slip": 0, "Yoghurt slip two": 0, "Red wine": 1, "Old tag": 1})
+            self.assertEqual(per_ml["Red wine"], 1)
+            self.assertEqual(len(got), 5, "A product listing the UK twice appears once")
+            self.assertEqual(verify_packs.check_pack(json.loads((t / "dist/index.unsigned.json").read_text())["packs"][0], t / "dist"), [])
+
+    def test_liquids_are_recognised(self):
+        self.assertTrue(extract_dump.is_liquid({"quantity": "1 l"}))
+        self.assertTrue(extract_dump.is_liquid({"quantity": "330ml"}))
+        self.assertTrue(extract_dump.is_liquid({"serving_quantity_unit": "ml"}))
+        self.assertFalse(extract_dump.is_liquid({"quantity": "500 g"}))
+        self.assertFalse(extract_dump.is_liquid({"quantity": "1 l (1030 g)"}), "Given in grams too: leave it per 100 g")
+
+    def test_alcohol_is_in_percent(self):
+        self.assertEqual(extract_dump.factor_for("alcohol", "% vol"), 1.0)
+        self.assertIsNone(extract_dump.factor_for("alcohol", "g"))
+
+
 def make_pack(folder: Path, country: str = "united-kingdom", rows: list[tuple] | None = None, hostile: str | None = None) -> dict:
     rows = rows or [
         ("5000000000001", "Oat milk", "Brand", "1 l", None, None, 1, 46.0, 1.0, 6.6, 4.0, 1.5, 0.8, 0.1, 0, 3, 1),
@@ -135,6 +184,11 @@ class VerifyTests(unittest.TestCase):
             problems = verify_packs.check_pack(entry, self.dist)
             self.assertTrue(any("unexpected database objects" in p for p in problems), sql)
 
+    def test_tables_must_be_defined_exactly(self):
+        # Same table names, different definition: a pack built by anything but build_packs.py.
+        entry = make_pack(self.dist, hostile="DROP TABLE meta; CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT 'x');")
+        self.assertTrue(any("defined exactly" in p for p in verify_packs.check_pack(entry, self.dist)))
+
     def test_counts_are_recounted_not_trusted(self):
         entry = make_pack(self.dist)
         entry["product_count"] = 999
@@ -192,6 +246,20 @@ class SignAndStageTests(unittest.TestCase):
             bad = self.run_script("scripts/stage_release.py", "--dist", dist, "--signed", t / "signed", "--public", t / "pub.pem",
                                   "--release", t / "rel2")
             self.assertNotEqual(bad.returncode, 0)
+
+    def test_signing_refuses_an_index_that_wasnt_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            dist = t / "dist"
+            dist.mkdir()
+            (dist / "index.unsigned.json").write_text(json.dumps(make_index([make_pack(dist)])))
+            self.keys(t)
+            wrong = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "s",
+                                    "--expect-index-sha256", "0" * 64)
+            self.assertNotEqual(wrong.returncode, 0)
+            right = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "s",
+                                    "--expect-index-sha256", build_packs.sha256(dist / "index.unsigned.json"))
+            self.assertEqual(right.returncode, 0, right.stderr)
 
     def test_signing_refuses_unlisted_files(self):
         with tempfile.TemporaryDirectory() as tmp:

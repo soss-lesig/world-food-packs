@@ -33,9 +33,11 @@ anything that can write to the repo:
    they become file names; accents are stripped and Türkiye is merged into
    turkey. Nutrition is only kept when it's plausible: over 900 kcal per 100 g,
    negative values, macros over 105 g, more sugar than carbs, kcal and kJ that
-   disagree (outside 3 to 5.5 kJ per kcal), or energy more than three times
-   off what the protein, carbs and fat add up to blank it rather than guess.
-   Each product's nutrition comes from one label, never a mix.
+   disagree (outside 3 to 5.5 kJ per kcal), or energy under half or over three
+   times what the protein, carbs, fat and alcohol add up to blank it rather than
+   guess. Each product's nutrition comes from one label, never a mix. Drinks
+   (per 100 ml) are marked so the app shows ml. Tags that aren't countries today
+   (world, yugoslavia and the like) get no pack.
 2. **verify** (no secrets, read-only, `scripts/verify_packs.py`): trusts
    nothing the build says about itself. Checks the index's exact shape, that
    the folder holds only the listed files, every hash and size, then opens
@@ -49,7 +51,10 @@ anything that can write to the repo:
 3. **sign** (the key and nothing else, `scripts/sign_packs.py`): no network
    calls and no write access. Re-checks the shape and every hash, so it signs
    exactly what was verified, then signs each pack and the index with Ed25519.
-   The key is written to a file only for this step and deleted however it ends.
+   It refuses any index that isn't byte for byte the one verify passed (verify
+   hands on its SHA-256, and the index pins every pack's), so nothing swapped
+   in between can be signed. The key is written to a file only for this step and
+   deleted however it ends.
 4. **publish** (write access, no key, `scripts/stage_release.py`): proves every
    signature against `keys/food-pack-public.pem`, copies only the index, its
    signature and the listed packs into a release folder, and publishes that.
@@ -62,16 +67,32 @@ commits. `tests/` covers the scripts and runs at the start of every build.
 The signing key lives in a GitHub **Environment** called `food-pack-signing`,
 not in the repo's general secrets, so only workflow runs from `main` can use it.
 
+**Do all of this in Settings before merging the workflow.** If the workflow names
+an environment that doesn't exist yet, GitHub creates it with no branch rule, and
+the job quietly falls back to a repository-level secret of the same name.
+
 1. Settings, Environments, New environment: `food-pack-signing`.
 2. Deployment branches and tags: Selected branches, add `main`.
-3. Add the environment secret `FOOD_PACK_SIGNING_KEY` (the private key PEM).
+3. Add the environment secret `FOOD_PACK_SIGNING_KEY`. GitHub never shows a
+   secret again once saved, so:
+   - **If you still have the private key file** (offline), paste that.
+   - **If not**, make a new pair and follow "Changing the key" below.
 4. Delete any repository-level secret with that name.
 5. Settings, Branches: protect `main` (no force pushes, no deletion).
+6. Keep an offline backup of the private key (a password manager is fine).
 
-If the key is ever lost or leaked: generate a new pair
-(`openssl genpkey -algorithm ed25519`), replace the environment secret and
-`keys/food-pack-public.pem`, and ship an app update with the new public key.
-Old app versions will refuse new packs until they update, which is the point.
+### Changing the key
+
+1. `openssl genpkey -algorithm ed25519 -out new-key.pem` and
+   `openssl pkey -in new-key.pem -pubout -out keys/food-pack-public.pem`
+   (copy the old public key to `keys/previous-public.pem` first).
+2. Replace the environment secret with `new-key.pem`, back it up, delete the file.
+3. Update the public key built into the app and ship an update. Old app versions
+   refuse new packs until they update, which is the point.
+4. The verify job checks last week's index against the current key, or
+   `keys/previous-public.pem` during the change, so the shrink gates keep working.
+   Delete `keys/previous-public.pem` once a release signed with the new key is out.
+   If nothing signed with the old key was ever published, skip the previous key.
 
 ## Using the packs
 

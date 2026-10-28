@@ -84,6 +84,10 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read # to read last week's release
+    outputs:
+      # The fingerprint of the index that passed. The index pins every pack's SHA-256, so the sign job
+      # signs exactly this, even if someone swapped the artefact after verify downloaded it.
+      index_sha256: ${{ steps.pin.outputs.index_sha256 }}
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
@@ -114,7 +118,13 @@ jobs:
           fi
           gh release download "$TAG" --pattern index.json --pattern index.json.sig --dir previous
           base64 -d previous/index.json.sig > previous/index.sig.bin
-          openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin -in previous/index.json -sigfile previous/index.sig.bin
+          # The current key, or during a key change the one before it (keys/previous-public.pem).
+          ok=no
+          for key in keys/food-pack-public.pem keys/previous-public.pem; do
+            [ -f "$key" ] || continue
+            if openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in previous/index.json -sigfile previous/index.sig.bin; then ok=yes; break; fi
+          done
+          [ "$ok" = yes ] || { echo "Last week's index doesn't verify with the current or previous key"; exit 1; }
           echo "PREVIOUS=--previous previous/index.json" >> "$GITHUB_ENV"
 
       - name: Open Food Facts' live UK count
@@ -124,6 +134,10 @@ jobs:
 
       - name: Verify every pack and run the gates
         run: python -I scripts/verify_packs.py --dist dist $PREVIOUS --live-count-file live.json --min-uk "$MIN_UK"
+
+      - name: Pin what passed
+        id: pin
+        run: echo "index_sha256=$(sha256sum dist/index.unsigned.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
   sign:
     needs: verify
@@ -145,11 +159,12 @@ jobs:
       - name: Sign
         env:
           SIGNING_KEY: ${{ secrets.FOOD_PACK_SIGNING_KEY }}
+          VERIFIED_INDEX: ${{ needs.verify.outputs.index_sha256 }}
         run: |
           umask 077
           trap 'rm -f "$RUNNER_TEMP/key.pem"' EXIT
           printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          python3 -I scripts/sign_packs.py --dist dist --key "$RUNNER_TEMP/key.pem" --out signed
+          python3 -I scripts/sign_packs.py --dist dist --key "$RUNNER_TEMP/key.pem" --out signed --expect-index-sha256 "$VERIFIED_INDEX"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -184,6 +199,7 @@ jobs:
           path: signed
 
       - name: Check every signature and stage the release
+        shell: bash # -eo pipefail, so a failure isn't hidden by tee
         run: python3 -I scripts/stage_release.py --dist dist --signed signed --public keys/food-pack-public.pem --release release | tee stage.log
 
       - name: Publish release

@@ -28,11 +28,16 @@ from pathlib import Path
 
 import duckdb
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from build_schema import SCHEMA  # noqa: E402  (shared with verify_packs.py)
+
 SCHEMA_VERSION = 3
 SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")  # the only shape a country may have: it becomes a file name
 SOURCE = "Open Food Facts (https://world.openfoodfacts.org)"
 LICENCE = "ODbL 1.0 (https://opendatacommons.org/licenses/odbl/1-0/)"
 MIN_PER_COUNTRY = 500
+# Open Food Facts tags that aren't a country you can live in today.
+NOT_COUNTRIES = ("world", "yugoslavia", "soviet-union", "czechoslovakia", "east-germany", "serbia-and-montenegro")
 
 # One row per product and country. Names prefer English, then the product's
 # main language, then any name at all. Nutrition is per 100 g (or 100 ml) and
@@ -46,15 +51,16 @@ MIN_PER_COUNTRY = 500
 # (about 4.2 times too high) or the other way round. If both energies are given
 # they must roughly agree (kJ is 4.184 x kcal; 3 to 5.5 allows for label
 # rounding, which is common, while a ratio near 1 or 17 is a slip); if protein,
-# carbs and fat are given, the energy must be within a factor of 3 of what they
-# add up to.
+# carbs and fat are given (plus alcohol at 7 kcal/g, 5.53 kcal per % vol per
+# 100 ml), the energy must be between half and three times what they add up to.
+# Half catches kcal typed into the kJ box (a quarter of the real figure).
 QUERY = r"""
 WITH src AS (
   SELECT * FROM read_json($slim, format = 'newline_delimited', columns = {
     code: 'VARCHAR', name: 'VARCHAR', brands: 'VARCHAR', quantity: 'VARCHAR', serving_size: 'VARCHAR',
     serving_quantity: 'DOUBLE', countries: 'VARCHAR[]', scans: 'BIGINT', updated_at: 'BIGINT', obsolete: 'BOOLEAN',
     kcal: 'DOUBLE', kj: 'DOUBLE', protein: 'DOUBLE', carbs: 'DOUBLE', sugar: 'DOUBLE', fat: 'DOUBLE',
-    fibre: 'DOUBLE', salt: 'DOUBLE', per: 'VARCHAR'})
+    fibre: 'DOUBLE', salt: 'DOUBLE', alcohol: 'DOUBLE', per: 'VARCHAR'})
   WHERE NOT coalesce(obsolete, false)
     AND regexp_full_match(code, '[0-9]{8,14}')
     AND name IS NOT NULL AND length(name) BETWEEN 2 AND 200
@@ -62,20 +68,21 @@ WITH src AS (
 nut AS (
   SELECT *, coalesce(kcal, kj / 4.184) AS energy,
     CASE WHEN protein IS NOT NULL AND carbs IS NOT NULL AND fat IS NOT NULL
-         THEN 4 * protein + 4 * carbs + 9 * fat END AS from_macros
+         THEN 4 * protein + 4 * carbs + 9 * fat + 5.53 * coalesce(alcohol, 0) END AS from_macros
   FROM src
 ),
 checked AS (
   SELECT *,
     energy IS NOT NULL AND energy BETWEEN 0 AND 900
     AND (kcal IS NULL OR kj IS NULL OR (kcal < 2 AND kj < 10) OR kj / nullif(kcal, 0) BETWEEN 3.0 AND 5.5)
-    AND (from_macros IS NULL OR energy BETWEEN from_macros / 3 - 20 AND from_macros * 3 + 20)
+    AND (from_macros IS NULL OR energy BETWEEN from_macros * 0.5 - 10 AND from_macros * 3 + 20)
     AND coalesce(protein, 0) BETWEEN 0 AND 100
     AND coalesce(carbs, 0)   BETWEEN 0 AND 100
     AND coalesce(sugar, 0)   BETWEEN 0 AND 100
     AND coalesce(fat, 0)     BETWEEN 0 AND 100
     AND coalesce(fibre, 0)   BETWEEN 0 AND 100
     AND coalesce(salt, 0)    BETWEEN 0 AND 100
+    AND coalesce(alcohol, 0) BETWEEN 0 AND 100
     AND coalesce(protein, 0) + coalesce(carbs, 0) + coalesce(fat, 0) <= 105
     AND (sugar IS NULL OR carbs IS NULL OR sugar <= carbs + 1) AS ok
   FROM nut
@@ -110,35 +117,11 @@ SELECT
   scans,
   CASE WHEN per = '100ml' THEN 1 ELSE 0 END AS per_ml
 FROM places, unnest(slugs) AS t(c)
-WHERE regexp_full_match(c, '[a-z0-9]+(-[a-z0-9]+)*')
+WHERE regexp_full_match(c, '[a-z0-9]+(-[a-z0-9]+)*') AND c NOT IN $not_countries
 ORDER BY country, code
 """
 
-SCHEMA = """
-PRAGMA page_size = 4096;
-PRAGMA journal_mode = DELETE;
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE products (
-  id           INTEGER PRIMARY KEY,
-  barcode      TEXT NOT NULL UNIQUE,
-  name         TEXT NOT NULL,
-  brand        TEXT,
-  quantity     TEXT,
-  serving_size TEXT,
-  serving_g    REAL,
-  has_nutrition INTEGER NOT NULL,  -- 1 if the per-100 g values below are usable
-  kcal REAL, protein REAL, carbs REAL, sugar REAL, fat REAL, fibre REAL, salt REAL,
-  updated_at   INTEGER,
-  scans        INTEGER NOT NULL DEFAULT 0,  -- unique scans on Open Food Facts: how popular it is
-  per_ml       INTEGER NOT NULL DEFAULT 0   -- 1 if the values are per 100 ml rather than per 100 g
-);
-CREATE VIRTUAL TABLE products_fts USING fts5(
-  name, brand,
-  content = 'products', content_rowid = 'id',
-  tokenize = 'unicode61 remove_diacritics 2',
-  prefix = '2 3'
-);
-"""
+
 
 
 def sha256(path: Path) -> str:
@@ -166,6 +149,7 @@ def country_name(slug: str) -> str:
 def write_pack(rows: list[tuple], db_path: Path, meta: dict) -> int:
     db_path.unlink(missing_ok=True)
     con = sqlite3.connect(db_path)
+    con.executescript("PRAGMA page_size = 4096; PRAGMA journal_mode = DELETE;")
     con.executescript(SCHEMA)
     con.executemany(
         "INSERT INTO products (barcode, name, brand, quantity, serving_size, serving_g, has_nutrition,"
@@ -201,7 +185,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect()
-    con.execute(f"CREATE TABLE packed AS {QUERY}", {"slim": str(args.slim)})
+    con.execute(f"CREATE TABLE packed AS {QUERY}", {"slim": str(args.slim), "not_countries": list(NOT_COUNTRIES)})
     counts = con.execute("SELECT country, count(*) FROM packed GROUP BY 1 ORDER BY 1").fetchall()
 
     packs = []
