@@ -22,44 +22,77 @@ ignores values marked as estimates from ingredients.
 
 ## What the weekly build does
 
-Two jobs, so the signing key never meets downloaded data:
+Four jobs, so the signing key never shares a room with anything downloaded or
+anything that can write to the repo:
 
-1. **build** (no secrets): streams the dump and hashes it as it reads, never
-   storing it (`scripts/extract_dump.py`). Any hash mismatch stops the build.
-   Then writes one SQLite pack per country with at least 500 products
-   (`scripts/build_packs.py`). Products sold in several countries go in each.
-   Nutrition is only kept when it's plausible: over 900 kcal per 100 g,
-   negative values, macros over 105 g or more sugar than carbs blank it rather
-   than guess. Energy given only in kJ is converted.
-2. **sign** (has the key, never reads the dump): re-hashes every pack, checks
-   the gates, signs each pack and the index with Ed25519, proves every
-   signature against `keys/food-pack-public.pem`, and publishes a release.
-   Gates: the UK pack has at least 150,000 products and at least 80% of the
-   live UK count when Open Food Facts' API answers; no country over 5,000
-   products shrinks by more than 20% in a week; every file under 2 GiB.
+1. **build** (no secrets, read-only): streams the dump and hashes it as it
+   reads, never storing it (`scripts/extract_dump.py`); any hash mismatch stops
+   the build. Then writes one SQLite pack per country with at least 500
+   products (`scripts/build_packs.py`). Products sold in several countries go
+   in each. Country names must be plain slugs (`a-z`, `0-9`, hyphens), since
+   they become file names; accents are stripped and Türkiye is merged into
+   turkey. Nutrition is only kept when it's plausible: over 900 kcal per 100 g,
+   negative values, macros over 105 g, more sugar than carbs, kcal and kJ that
+   disagree (outside 3 to 5.5 kJ per kcal), or energy more than three times
+   off what the protein, carbs and fat add up to blank it rather than guess.
+   Each product's nutrition comes from one label, never a mix.
+2. **verify** (no secrets, read-only, `scripts/verify_packs.py`): trusts
+   nothing the build says about itself. Checks the index's exact shape, that
+   the folder holds only the listed files, every hash and size, then opens
+   every pack: exactly the expected tables (no views or triggers), SQLite's
+   integrity check, every value in range, and the counts recounted. Gates: the
+   UK pack has at least 150,000 products and 60% with nutrition; at least 80%
+   of Open Food Facts' live UK count when their API answers (a warning on the
+   run when it doesn't); against last week's signature-checked release, no
+   country over 5,000 products shrinks by more than 20% and the UK's share with
+   nutrition doesn't fall by more than 10 points.
+3. **sign** (the key and nothing else, `scripts/sign_packs.py`): no network
+   calls and no write access. Re-checks the shape and every hash, so it signs
+   exactly what was verified, then signs each pack and the index with Ed25519.
+   The key is written to a file only for this step and deleted however it ends.
+4. **publish** (write access, no key, `scripts/stage_release.py`): proves every
+   signature against `keys/food-pack-public.pem`, copies only the index, its
+   signature and the listed packs into a release folder, and publishes that.
 
 Dependencies are pinned by hash in `requirements.txt`; actions are pinned to
-commits.
+commits. `tests/` covers the scripts and runs at the start of every build.
+
+## Setting up the key
+
+The signing key lives in a GitHub **Environment** called `food-pack-signing`,
+not in the repo's general secrets, so only workflow runs from `main` can use it.
+
+1. Settings, Environments, New environment: `food-pack-signing`.
+2. Deployment branches and tags: Selected branches, add `main`.
+3. Add the environment secret `FOOD_PACK_SIGNING_KEY` (the private key PEM).
+4. Delete any repository-level secret with that name.
+5. Settings, Branches: protect `main` (no force pushes, no deletion).
+
+If the key is ever lost or leaked: generate a new pair
+(`openssl genpkey -algorithm ed25519`), replace the environment secret and
+`keys/food-pack-public.pem`, and ship an app update with the new public key.
+Old app versions will refuse new packs until they update, which is the point.
 
 ## Using the packs
 
-Always-current URLs:
-
 - Index: `https://github.com/soss-lesig/world-food-packs/releases/latest/download/index.json`
 - Its signature: `.../index.json.sig` (base64 Ed25519 over the exact bytes of index.json)
-- A pack: `.../<country>.sqlite.deflate`, for example `united-kingdom.sqlite.deflate`
+- A pack, from the index's own release so a mid-download publish can't mix
+  weeks: `https://github.com/soss-lesig/world-food-packs/releases/download/packs-<version>/<country>.sqlite.deflate`
 
-To accept the index, verify `index.json.sig` against `keys/food-pack-public.pem`.
-To accept a pack, check its size, SHA-256 and `signature` from the index entry,
-then inflate it (raw DEFLATE, no zlib header) and open it read-only.
+To accept the index, verify `index.json.sig` against `keys/food-pack-public.pem`,
+and refuse a `version` older than the newest one already seen. To accept a pack,
+check its size, SHA-256 and `signature` from the index entry, then inflate it
+(raw DEFLATE, no zlib header) and open it read-only.
 
-### Schema (version 2)
+### Schema (version 3)
 
 - `products`: `barcode` (unique), `name`, `brand`, `quantity`, `serving_size`,
-  `serving_g`, `has_nutrition` (1 or 0), per 100 g `kcal`, `protein`, `carbs`,
-  `sugar`, `fat`, `fibre`, `salt` (grams except kcal; null when
-  `has_nutrition` is 0), `updated_at` (Unix time) and `scans` (unique scans on
-  Open Food Facts, for putting popular products first)
+  `serving_g`, `has_nutrition` (1 or 0), per 100 g (or 100 ml when `per_ml`
+  is 1) `kcal`, `protein`, `carbs`, `sugar`, `fat`, `fibre`, `salt` (grams
+  except kcal; null when `has_nutrition` is 0), `updated_at` (Unix time),
+  `scans` (unique scans on Open Food Facts, for putting popular products
+  first) and `per_ml`
 - `products_fts`: FTS5 index on `name` and `brand`, accent-insensitive, with
   prefix indexes for search-as-you-type
 - `meta`: build details, including `pack_version`, `country`, `product_count`
@@ -76,7 +109,13 @@ curl -sL https://static.openfoodfacts.org/data/openfoodfacts-mongodbdump.gz \
 ```
 
 About 12 minutes to read the dump and 2 to build, with a 4 GB memory peak.
-To try signing, use a throwaway key: `openssl genpkey -algorithm ed25519`.
+To check and sign locally, with a throwaway key (`openssl genpkey -algorithm ed25519`):
+
+```sh
+.venv/bin/python -I scripts/verify_packs.py --dist dist --first-release --min-uk 150000
+.venv/bin/python -I scripts/sign_packs.py --dist dist --key test-key.pem --out signed
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Licences
 
@@ -84,6 +123,3 @@ The data is under the ODbL 1.0, see [DATA-LICENCE.md](DATA-LICENCE.md).
 Contains data from Open Food Facts, available under the Open Database License.
 The code is MIT, see [LICENSE](LICENSE).
 
-The signing key lives only in the repo's Actions secrets. If it's ever lost or
-leaked, generate a new pair, replace the secret and the public key here, and
-ship an app update with the new public key.

@@ -20,6 +20,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import re
 import sqlite3
 import sys
 import zlib
@@ -27,30 +28,48 @@ from pathlib import Path
 
 import duckdb
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")  # the only shape a country may have: it becomes a file name
 SOURCE = "Open Food Facts (https://world.openfoodfacts.org)"
 LICENCE = "ODbL 1.0 (https://opendatacommons.org/licenses/odbl/1-0/)"
 MIN_PER_COUNTRY = 500
 
 # One row per product and country. Names prefer English, then the product's
-# main language, then any name at all. Nutrition is per 100 g and only kept
-# when it's plausible: impossible values blank the nutrition rather than drop
-# the product, so a scan can still recognise it.
+# main language, then any name at all. Nutrition is per 100 g (or 100 ml) and
+# only kept when it's plausible: impossible values blank the nutrition rather
+# than drop the product, so a scan can still recognise it.
+#
+# Countries: only en: tags, accents stripped (Türkiye -> turkiye, then merged
+# with turkey), each country once per product, and only plain slugs survive.
+#
+# Energy checks catch the classic data-entry slips: kJ typed into the kcal box
+# (about 4.2 times too high) or the other way round. If both energies are given
+# they must roughly agree (kJ is 4.184 x kcal; 3 to 5.5 allows for label
+# rounding, which is common, while a ratio near 1 or 17 is a slip); if protein,
+# carbs and fat are given, the energy must be within a factor of 3 of what they
+# add up to.
 QUERY = r"""
 WITH src AS (
   SELECT * FROM read_json($slim, format = 'newline_delimited', columns = {
     code: 'VARCHAR', name: 'VARCHAR', brands: 'VARCHAR', quantity: 'VARCHAR', serving_size: 'VARCHAR',
     serving_quantity: 'DOUBLE', countries: 'VARCHAR[]', scans: 'BIGINT', updated_at: 'BIGINT', obsolete: 'BOOLEAN',
     kcal: 'DOUBLE', kj: 'DOUBLE', protein: 'DOUBLE', carbs: 'DOUBLE', sugar: 'DOUBLE', fat: 'DOUBLE',
-    fibre: 'DOUBLE', salt: 'DOUBLE'})
+    fibre: 'DOUBLE', salt: 'DOUBLE', per: 'VARCHAR'})
   WHERE NOT coalesce(obsolete, false)
     AND regexp_full_match(code, '[0-9]{8,14}')
     AND name IS NOT NULL AND length(name) BETWEEN 2 AND 200
 ),
-nut AS (SELECT *, coalesce(kcal, kj / 4.184) AS energy FROM src),
+nut AS (
+  SELECT *, coalesce(kcal, kj / 4.184) AS energy,
+    CASE WHEN protein IS NOT NULL AND carbs IS NOT NULL AND fat IS NOT NULL
+         THEN 4 * protein + 4 * carbs + 9 * fat END AS from_macros
+  FROM src
+),
 checked AS (
   SELECT *,
     energy IS NOT NULL AND energy BETWEEN 0 AND 900
+    AND (kcal IS NULL OR kj IS NULL OR (kcal < 2 AND kj < 10) OR kj / nullif(kcal, 0) BETWEEN 3.0 AND 5.5)
+    AND (from_macros IS NULL OR energy BETWEEN from_macros / 3 - 20 AND from_macros * 3 + 20)
     AND coalesce(protein, 0) BETWEEN 0 AND 100
     AND coalesce(carbs, 0)   BETWEEN 0 AND 100
     AND coalesce(sugar, 0)   BETWEEN 0 AND 100
@@ -65,12 +84,19 @@ latest AS (
   SELECT *, row_number() OVER (PARTITION BY code ORDER BY updated_at DESC NULLS LAST) AS rn
   FROM checked
 )
+, places AS (
+  SELECT *, list_distinct(list_transform(
+      list_filter(countries, lambda c: starts_with(c, 'en:')),
+      lambda c: CASE strip_accents(lower(substr(c, 4))) WHEN 'turkiye' THEN 'turkey' ELSE strip_accents(lower(substr(c, 4))) END
+    )) AS slugs
+  FROM latest WHERE rn = 1
+)
 SELECT
-  replace(c, 'en:', '') AS country,
-  code, name,
-  nullif(trim(split_part(brands, ',', 1)), '') AS brand,
-  nullif(trim(quantity), '') AS quantity,
-  nullif(trim(serving_size), '') AS serving_size,
+  c AS country,
+  code, left(name, 150) AS name,
+  left(nullif(trim(split_part(brands, ',', 1)), ''), 100) AS brand,
+  left(nullif(trim(quantity), ''), 60) AS quantity,
+  left(nullif(trim(serving_size), ''), 60) AS serving_size,
   CASE WHEN serving_quantity BETWEEN 0 AND 5000 THEN round(serving_quantity, 1) END AS serving_g,
   CASE WHEN ok THEN 1 ELSE 0 END AS has_nutrition,
   CASE WHEN ok THEN round(energy, 1) END,
@@ -81,9 +107,10 @@ SELECT
   CASE WHEN ok THEN round(fibre, 2) END,
   CASE WHEN ok THEN round(salt, 3) END,
   updated_at,
-  scans
-FROM latest, unnest(countries) AS t(c)
-WHERE rn = 1 AND c LIKE 'en:%'
+  scans,
+  CASE WHEN per = '100ml' THEN 1 ELSE 0 END AS per_ml
+FROM places, unnest(slugs) AS t(c)
+WHERE regexp_full_match(c, '[a-z0-9]+(-[a-z0-9]+)*')
 ORDER BY country, code
 """
 
@@ -102,7 +129,8 @@ CREATE TABLE products (
   has_nutrition INTEGER NOT NULL,  -- 1 if the per-100 g values below are usable
   kcal REAL, protein REAL, carbs REAL, sugar REAL, fat REAL, fibre REAL, salt REAL,
   updated_at   INTEGER,
-  scans        INTEGER NOT NULL DEFAULT 0  -- unique scans on Open Food Facts: how popular it is
+  scans        INTEGER NOT NULL DEFAULT 0,  -- unique scans on Open Food Facts: how popular it is
+  per_ml       INTEGER NOT NULL DEFAULT 0   -- 1 if the values are per 100 ml rather than per 100 g
 );
 CREATE VIRTUAL TABLE products_fts USING fts5(
   name, brand,
@@ -141,8 +169,8 @@ def write_pack(rows: list[tuple], db_path: Path, meta: dict) -> int:
     con.executescript(SCHEMA)
     con.executemany(
         "INSERT INTO products (barcode, name, brand, quantity, serving_size, serving_g, has_nutrition,"
-        " kcal, protein, carbs, sugar, fat, fibre, salt, updated_at, scans)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " kcal, protein, carbs, sugar, fat, fibre, salt, updated_at, scans, per_ml)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     con.execute("INSERT INTO products_fts(products_fts) VALUES ('rebuild')")
@@ -180,6 +208,8 @@ def main() -> None:
     for country, count in counts:
         if count < args.min_per_country:
             continue
+        if not SLUG.fullmatch(country):
+            sys.exit(f"refusing country name {country!r}")  # the query filters these; this is a second lock
         items = [r[1:] for r in con.execute("SELECT * FROM packed WHERE country = ? ORDER BY code", [country]).fetchall()]
         db = args.out / f"{country}.sqlite"
         meta = {

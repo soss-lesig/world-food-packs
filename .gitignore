@@ -1,7 +1,7 @@
 dist/
 __pycache__/
 *.pem
-!keys/*.pem
+!keys/food-pack-public.pem
 *.csv
 *.csv.gz
 *.tsv

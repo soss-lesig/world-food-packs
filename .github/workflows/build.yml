@@ -1,9 +1,16 @@
 name: Build world food packs
 
-# Weekly: stream Open Food Facts' raw database dump (the only source), check it
-# against their published SHA-256, build one pack per country, then sign and
-# publish them in a separate job. The build job has no secrets and is the only
-# one that touches downloaded data; the sign job has the key and never does.
+# Weekly, in four jobs, so the signing key never shares a room with anything
+# downloaded or anything that can write to the repo:
+#
+#   build    no secrets, read-only   streams Open Food Facts' raw database dump (the only
+#                                    source), checks its SHA-256, builds one pack per country
+#   verify   no secrets, read-only   opens every pack and checks it; runs the sanity gates
+#   sign     the key, nothing else   signs exactly what was verified; no network, no write access
+#   publish  write access, no key    checks every signature, then publishes the release
+#
+# The key lives in the food-pack-signing environment, which only the main branch
+# can use. See README.md, "Setting up the key".
 
 on:
   schedule:
@@ -19,8 +26,11 @@ concurrency:
 env:
   OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-mongodbdump.gz
   OFF_DUMP_SHA_URL: https://static.openfoodfacts.org/data/gz-sha256sum
+  OFF_LIVE_URL: https://world.openfoodfacts.org/api/v2/search?countries_tags=en:united-kingdom&fields=code&page_size=1
   USER_AGENT: world-food-packs (https://github.com/${{ github.repository }})
+  CURL: curl --proto =https --proto-redir =https --fail --silent --show-error --location
   KEEP_RELEASES: 4
+  MIN_UK: 150000
 
 jobs:
   build:
@@ -40,19 +50,22 @@ jobs:
       - name: Install pinned dependencies
         run: pip install --require-hashes --only-binary=:all: -r requirements.txt
 
+      - name: Run the scripts' tests
+        run: python -m unittest discover -s tests -v
+
       - name: Get the dump's published SHA-256
         run: |
-          SHA=$(curl --fail --silent --show-error --location --retry 3 --user-agent "$USER_AGENT" "$OFF_DUMP_SHA_URL" \
+          SHA=$($CURL --retry 3 --user-agent "$USER_AGENT" "$OFF_DUMP_SHA_URL" \
                 | awk '$2 == "openfoodfacts-mongodbdump.gz" {print $1}')
           if ! [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]; then echo "No usable SHA-256 published for the dump"; exit 1; fi
           echo "DUMP_SHA=$SHA" >> "$GITHUB_ENV"
 
       - name: Stream the dump into the slim file
         # Read as it downloads and never stored. extract_dump.py hashes every byte
-        # and deletes its output if the hash doesn't match.
+        # and only keeps its output if the hash matches.
         run: |
           set -o pipefail
-          curl --fail --silent --show-error --location --retry 3 --retry-delay 30 --user-agent "$USER_AGENT" "$OFF_DUMP_URL" \
+          $CURL --retry 3 --retry-delay 30 --user-agent "$USER_AGENT" "$OFF_DUMP_URL" \
             | python -I scripts/extract_dump.py - --sha256 "$DUMP_SHA" --out "$RUNNER_TEMP/slim.jsonl"
 
       - name: Build country packs
@@ -65,15 +78,60 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  sign:
+  verify:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write # create releases
-      actions: write  # keep the schedule from being switched off after 60 quiet days
+      contents: read # to read last week's release
     env:
       GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-packs
+          path: dist
+
+      - name: Last week's index, signature checked
+        # Required whenever a release exists, so the shrink gates can't be skipped
+        # just because the download failed.
+        run: |
+          TAG=$(gh release list --limit 100 --json tagName,createdAt \
+                --jq '[.[] | select(.tagName | startswith("packs-"))] | sort_by(.createdAt) | last | .tagName // empty')
+          if [ -z "$TAG" ]; then
+            echo "No previous packs release: this is the first."
+            echo "PREVIOUS=--first-release" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          gh release download "$TAG" --pattern index.json --pattern index.json.sig --dir previous
+          base64 -d previous/index.json.sig > previous/index.sig.bin
+          openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin -in previous/index.json -sigfile previous/index.sig.bin
+          echo "PREVIOUS=--previous previous/index.json" >> "$GITHUB_ENV"
+
+      - name: Open Food Facts' live UK count
+        # Saved as a file and read by Python, which only accepts a plain number.
+        # If their search is down, verify_packs.py warns and the other gates still run.
+        run: $CURL --retry 3 --retry-delay 20 --user-agent "$USER_AGENT" "$OFF_LIVE_URL" -o live.json || rm -f live.json
+
+      - name: Verify every pack and run the gates
+        run: python -I scripts/verify_packs.py --dist dist $PREVIOUS --live-count-file live.json --min-uk "$MIN_UK"
+
+  sign:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: food-pack-signing # only main can use it; the key lives here
+    permissions:
+      contents: read # checkout only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,52 +142,68 @@ jobs:
           name: unsigned-packs
           path: dist
 
-      - name: Last week's index and the live UK count
-        run: |
-          curl -sfL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/index.json" -o previous-index.json || rm -f previous-index.json
-          LIVE=$(curl -sf --retry 3 --retry-delay 20 --user-agent "$USER_AGENT" \
-                  "https://world.openfoodfacts.org/api/v2/search?countries_tags=en:united-kingdom&fields=code&page_size=1" \
-                  | jq -r '.count // empty' || true)
-          echo "live UK count: ${LIVE:-unavailable}"
-          echo "LIVE_UK=${LIVE}" >> "$GITHUB_ENV"
-
-      - name: Check and sign
+      - name: Sign
         env:
           SIGNING_KEY: ${{ secrets.FOOD_PACK_SIGNING_KEY }}
         run: |
           umask 077
+          trap 'rm -f "$RUNNER_TEMP/key.pem"' EXIT
           printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          python3 -I scripts/sign_packs.py --dist dist --key "$RUNNER_TEMP/key.pem" \
-            --previous previous-index.json ${LIVE_UK:+--live-count "$LIVE_UK"} --min-uk 150000
-          rm -f "$RUNNER_TEMP/key.pem"
-          # Prove every signature checks out against the public key the app ships with.
-          for f in index.json $(jq -r '.packs[].file' dist/index.json); do
-            if [ "$f" = index.json ]; then sig=$(cat dist/index.json.sig); else sig=$(jq -r --arg f "$f" '.packs[] | select(.file == $f) | .signature' dist/index.json); fi
-            openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin -in "dist/$f" -sigfile <(echo "$sig" | base64 -d)
-          done
+          python3 -I scripts/sign_packs.py --dist dist --key "$RUNNER_TEMP/key.pem" --out signed
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-index
+          path: signed/
+          retention-days: 2
+          if-no-files-found: error
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create releases
+      actions: write  # keep the schedule from being switched off after 60 quiet days
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-packs
+          path: dist
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-index
+          path: signed
+
+      - name: Check every signature and stage the release
+        run: python3 -I scripts/stage_release.py --dist dist --signed signed --public keys/food-pack-public.pem --release release | tee stage.log
 
       - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(jq -r .version dist/index.json)
-          COUNT=$(jq -r '.packs | length' dist/index.json)
+          VERSION=$(sed -n 's/^version=\([0-9]\{8\}\)$/\1/p' stage.log)
+          [ -n "$VERSION" ] || { echo "no version"; exit 1; }
+          COUNT=$(find release -name '*.sqlite.deflate' | wc -l)
+          SOURCE=$(python3 -I -c 'import json; print(json.load(open("release/index.json"))["source_sha256"])')
           TAG="packs-${VERSION}"
           gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
-          gh release create "$TAG" dist/* \
+          gh release create "$TAG" release/* \
             --title "World food packs ${VERSION}" \
-            --notes "${COUNT} country packs from the Open Food Facts database dump (SHA-256 $(jq -r .source_sha256 dist/index.json)), available under the ODbL 1.0." \
+            --notes "${COUNT} country packs from the Open Food Facts database dump (SHA-256 ${SOURCE}), available under the ODbL 1.0." \
             --latest
 
       - name: Prune old releases
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           gh release list --limit 100 --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("packs-"))] | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' \
           | while read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done
 
       - name: Keep schedule alive
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/enable"
