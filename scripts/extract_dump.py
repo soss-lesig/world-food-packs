@@ -266,19 +266,10 @@ def slim(raw: bytes) -> dict | None:
     else:
         for field, key in NUTRIENTS.items():
             out[field] = number(nut.get(key)) if hasattr(nut, "get") else None
-        out["per"] = "100ml" if doc.get("nutrition_data_per") == "100ml" or is_liquid(doc) else "100g"
+        # Only when the label says so. Guessing from "500 ml" also caught ice creams, which are labelled per
+        # 100 g; showing a drink per 100 g instead costs almost nothing.
+        out["per"] = "100ml" if doc.get("nutrition_data_per") == "100ml" else "100g"
     return out
-
-
-LIQUID = re.compile(r"\d\s*(ml|cl|dl|l|litres?|liters?|fl\.? ?oz)\b", re.IGNORECASE)
-
-
-def is_liquid(doc) -> bool:
-    """Old-style products don't say per 100 ml, but a pack sold in ml or litres is labelled per 100 ml."""
-    if str(doc.get("serving_quantity_unit") or "").lower() == "ml":
-        return True
-    quantity = doc.get("quantity")
-    return isinstance(quantity, str) and bool(LIQUID.search(quantity)) and not re.search(r"\d\s*(g|kg)\b", quantity, re.IGNORECASE)
 
 
 def main() -> None:

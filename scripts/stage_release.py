@@ -46,9 +46,13 @@ def main() -> None:
     ap.add_argument("--signed", required=True, type=Path)
     ap.add_argument("--public", required=True, type=Path)
     ap.add_argument("--release", required=True, type=Path)
+    ap.add_argument("--expect-index-sha256", required=True, help="SHA-256 of the index the sign job signed")
     args = ap.parse_args()
 
     index_file = args.signed / "index.json"
+    # Only what this run's sign job signed: not an older, genuinely signed index swapped in.
+    if sha256(index_file) != args.expect_index_sha256.strip().lower():
+        sys.exit("Not publishing: the signed index isn't the one this run signed")
     if not verify(index_file, (args.signed / "index.json.sig").read_text(), args.public):
         sys.exit("index.json signature doesn't verify")
     index = json.loads(index_file.read_text())

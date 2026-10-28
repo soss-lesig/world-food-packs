@@ -48,11 +48,11 @@ def main() -> None:
     ap.add_argument("--dist", required=True, type=Path)
     ap.add_argument("--key", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--expect-index-sha256", help="SHA-256 of the index the verify job passed")
+    ap.add_argument("--expect-index-sha256", required=True, help="SHA-256 of the index the verify job passed")
     args = ap.parse_args()
 
     index_path = args.dist / "index.unsigned.json"
-    if args.expect_index_sha256 is not None and sha256(index_path) != args.expect_index_sha256.strip().lower():
+    if sha256(index_path) != args.expect_index_sha256.strip().lower():
         sys.exit("Not signing: the index isn't the one that was verified")
     index = json.loads(index_path.read_text())
     problems = shape(index)

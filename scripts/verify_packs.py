@@ -80,28 +80,42 @@ VALUE_RULES = {
     # The build allows 105 before rounding to two places, so allow for rounding here.
     "macros add up": "coalesce(protein, 0) + coalesce(carbs, 0) + coalesce(fat, 0) > 105.05",
     "scans": "scans < 0",
+    # Types and missing values, so a loosened definition can't slip blanks through.
+    "missing or mistyped required fields": (
+        "barcode IS NULL OR name IS NULL OR has_nutrition IS NULL OR per_ml IS NULL OR scans IS NULL "
+        "OR typeof(barcode) != 'text' OR typeof(name) != 'text' OR typeof(has_nutrition) != 'integer' "
+        "OR typeof(per_ml) != 'integer' OR typeof(scans) != 'integer' OR id IS NOT rowid"
+    ),
 }
 
 
-def normalise_sql(sql: str) -> str:
-    """A table's CREATE statement without comments or layout, for comparing exactly."""
+def normalise_sql(sql: str) -> str | None:
+    """A table's CREATE statement without comments or layout, for comparing exactly. Anything but plain ASCII
+    is refused (None): SQLite reads a non-breaking space as part of a name, so splitting on it would hide a change."""
+    if not sql.isascii():
+        return None
     no_comments = re.sub(r"--[^\n]*", "", sql)
-    return " ".join(no_comments.replace("(", " ( ").replace(")", " ) ").replace(",", " , ").split()).lower()
+    spaced = no_comments.replace("(", " ( ").replace(")", " ) ").replace(",", " , ")
+    return " ".join(t for t in re.split(r"[ \t\r\n]+", spaced) if t).lower()
 
 
 _EXPECTED_SQL: dict[str, str] | None = None
 
 
 def expected_sql() -> dict[str, str]:
-    """Every table's CREATE statement as build_packs.py makes it (FTS5 writes its own shadow tables)."""
+    """Every table's CREATE statement, from build_schema.EXPECTED_SQL (the app holds the same list). This runner's
+    SQLite must write the schema exactly that way too, or the build stops here rather than on the phones."""
     global _EXPECTED_SQL
     if _EXPECTED_SQL is None:
         import build_schema
 
         con = sqlite3.connect(":memory:")
         con.executescript(build_schema.SCHEMA)
-        _EXPECTED_SQL = {n: normalise_sql(s) for n, s in con.execute("SELECT name, sql FROM sqlite_schema") if s}
+        made = {n: normalise_sql(s) for n, s in con.execute("SELECT name, sql FROM sqlite_schema") if s}
         con.close()
+        if made != build_schema.EXPECTED_SQL:
+            sys.exit("This SQLite writes the schema differently from build_schema.EXPECTED_SQL (and the app). Not publishing.")
+        _EXPECTED_SQL = build_schema.EXPECTED_SQL
     return _EXPECTED_SQL
 
 
@@ -212,6 +226,8 @@ def check_pack(p: dict, dist: Path) -> list[str]:
                 bad = con.execute(f"SELECT count(*) FROM products WHERE {where}").fetchone()[0]
                 if bad:
                     problems.append(f"{c}: {bad} rows break '{rule}'")
+            if con.execute("SELECT count(*) FROM meta WHERE key IS NULL OR value IS NULL").fetchone()[0]:
+                problems.append(f"{c} has empty build details")
             meta = dict(con.execute("SELECT key, value FROM meta").fetchall())
             if meta.get("country") != c:
                 problems.append(f"{c} meta says it's {meta.get('country')!r}")

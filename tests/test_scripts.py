@@ -107,12 +107,10 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(len(got), 5, "A product listing the UK twice appears once")
             self.assertEqual(verify_packs.check_pack(json.loads((t / "dist/index.unsigned.json").read_text())["packs"][0], t / "dist"), [])
 
-    def test_liquids_are_recognised(self):
-        self.assertTrue(extract_dump.is_liquid({"quantity": "1 l"}))
-        self.assertTrue(extract_dump.is_liquid({"quantity": "330ml"}))
-        self.assertTrue(extract_dump.is_liquid({"serving_quantity_unit": "ml"}))
-        self.assertFalse(extract_dump.is_liquid({"quantity": "500 g"}))
-        self.assertFalse(extract_dump.is_liquid({"quantity": "1 l (1030 g)"}), "Given in grams too: leave it per 100 g")
+    def test_schema_definitions_are_exact(self):
+        # A non-breaking space glues "INTEGER PRIMARY" into one type name, quietly dropping constraints.
+        self.assertIsNone(verify_packs.normalise_sql("CREATE TABLE meta (key TEXT\u00a0PRIMARY KEY, value TEXT NOT NULL)"))
+        self.assertEqual(verify_packs.expected_sql()["meta"], "create table meta ( key text primary key , value text not null )")
 
     def test_alcohol_is_in_percent(self):
         self.assertEqual(extract_dump.factor_for("alcohol", "% vol"), 1.0)
@@ -176,6 +174,12 @@ class VerifyTests(unittest.TestCase):
         self.assertNotEqual(verify_packs.shape(index), [])
         self.assertNotEqual(verify_packs.shape({**make_index([entry]), "extra": 1}), [])
 
+    def test_blank_required_fields_are_caught(self):
+        # The real schema refuses blanks outright; a mistyped value still gets in, so verify checks types too.
+        mistyped = ("5000000000004", "Oats", None, None, None, None, 1, 100.0, 1, 1, 1, 1, 1, 1, 0, "lots", 0)
+        entry = make_pack(self.dist, rows=[mistyped])
+        self.assertTrue(any("missing or mistyped" in p for p in verify_packs.check_pack(entry, self.dist)))
+
     def test_views_and_triggers_are_refused(self):
         for sql in ("CREATE VIEW v AS SELECT 1;",
                     "CREATE TRIGGER t AFTER INSERT ON meta BEGIN SELECT 1; END;",
@@ -233,10 +237,15 @@ class SignAndStageTests(unittest.TestCase):
             dist.mkdir()
             (dist / "index.unsigned.json").write_text(json.dumps(make_index([make_pack(dist)])))
             self.keys(t)
-            signed = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "signed")
+            signed = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "signed",
+                                     "--expect-index-sha256", build_packs.sha256(dist / "index.unsigned.json"))
             self.assertEqual(signed.returncode, 0, signed.stderr)
+            signed_sha = build_packs.sha256(t / "signed" / "index.json")
+            stale = self.run_script("scripts/stage_release.py", "--dist", dist, "--signed", t / "signed", "--public", t / "pub.pem",
+                                    "--release", t / "rel0", "--expect-index-sha256", "0" * 64)
+            self.assertNotEqual(stale.returncode, 0, "Only the index this run signed")
             ok = self.run_script("scripts/stage_release.py", "--dist", dist, "--signed", t / "signed", "--public", t / "pub.pem",
-                                 "--release", t / "rel")
+                                 "--release", t / "rel", "--expect-index-sha256", signed_sha)
             self.assertEqual(ok.returncode, 0, ok.stderr)
             self.assertEqual(sorted(p.name for p in (t / "rel").iterdir()),
                              ["index.json", "index.json.sig", "united-kingdom.sqlite.deflate"])
@@ -244,7 +253,7 @@ class SignAndStageTests(unittest.TestCase):
             with (dist / "united-kingdom.sqlite.deflate").open("ab") as f:
                 f.write(b"x")
             bad = self.run_script("scripts/stage_release.py", "--dist", dist, "--signed", t / "signed", "--public", t / "pub.pem",
-                                  "--release", t / "rel2")
+                                  "--release", t / "rel2", "--expect-index-sha256", signed_sha)
             self.assertNotEqual(bad.returncode, 0)
 
     def test_signing_refuses_an_index_that_wasnt_verified(self):
@@ -269,7 +278,8 @@ class SignAndStageTests(unittest.TestCase):
             (dist / "index.unsigned.json").write_text(json.dumps(make_index([make_pack(dist)])))
             (dist / "extra.bin").write_bytes(b"surprise")
             self.keys(t)
-            r = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "s")
+            r = self.run_script("scripts/sign_packs.py", "--dist", dist, "--key", t / "key.pem", "--out", t / "s",
+                                "--expect-index-sha256", build_packs.sha256(dist / "index.unsigned.json"))
             self.assertNotEqual(r.returncode, 0)
 
 

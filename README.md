@@ -87,9 +87,13 @@ the job quietly falls back to a repository-level secret of the same name.
    `openssl pkey -in new-key.pem -pubout -out keys/food-pack-public.pem`
    (copy the old public key to `keys/previous-public.pem` first).
 2. Replace the environment secret with `new-key.pem`, back it up, delete the file.
-3. Update the public key built into the app and ship an update. Old app versions
-   refuse new packs until they update, which is the point.
-4. The verify job checks last week's index against the current key, or
+3. Run the workflow by hand and wait for a release signed with the new key
+   **before** installing an app with the new public key: that app deletes packs
+   signed with any other key, and an old-key index won't verify, so until a
+   new-key release exists it would have no food data.
+4. Then update the public key built into the app and ship the update. Old app
+   versions refuse new packs until they update, which is the point.
+5. The verify job checks last week's index against the current key, or
    `keys/previous-public.pem` during the change, so the shrink gates keep working.
    Delete `keys/previous-public.pem` once a release signed with the new key is out.
    If nothing signed with the old key was ever published, skip the previous key.
