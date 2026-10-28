@@ -1,1 +1,7 @@
-duckdb==2.0.0
+# Linux x86-64 wheels for Python 3.13 (the build runner), pinned by hash. pymongo is only used for its BSON reader.
+duckdb==2.0.0 \
+    --hash=sha256:ab51ec57d329d6f3df37c0287b55d71c3fc07bb54b61d1afed09104f953b1431
+pymongo==4.10.1 \
+    --hash=sha256:72e2ace7456167c71cfeca7dcb47bd5dceda7db2231265b80fc625c5e8073186
+dnspython==2.7.0 \
+    --hash=sha256:b4c34b7d10b51bcc3a5071e7b8dee77939f1e878477eeecc965e9835f63c6c86

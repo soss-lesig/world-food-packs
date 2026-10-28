@@ -1,27 +1,33 @@
-name: Build UK food pack
+name: Build world food packs
+
+# Weekly: stream Open Food Facts' raw database dump (the only source), check it
+# against their published SHA-256, build one pack per country, then sign and
+# publish them in a separate job. The build job has no secrets and is the only
+# one that touches downloaded data; the sign job has the key and never does.
 
 on:
   schedule:
     - cron: "17 4 * * 1" # Mondays, 04:17 UTC
   workflow_dispatch:
 
-permissions:
-  contents: write # create releases
-  actions: write  # keep the schedule from being switched off after 60 quiet days
+permissions: {}
 
 concurrency:
-  group: build-pack
+  group: build-packs
   cancel-in-progress: false
 
 env:
-  OFF_EXPORT_URL: https://static.openfoodfacts.org/data/en.openfoodfacts.org.products.csv.gz
+  OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-mongodbdump.gz
+  OFF_DUMP_SHA_URL: https://static.openfoodfacts.org/data/gz-sha256sum
+  USER_AGENT: world-food-packs (https://github.com/${{ github.repository }})
   KEEP_RELEASES: 4
-  GH_REPO: ${{ github.repository }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,57 +36,89 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install pinned dependencies
+        run: pip install --require-hashes --only-binary=:all: -r requirements.txt
 
-      - name: Download Open Food Facts export
+      - name: Get the dump's published SHA-256
         run: |
-          curl --fail --location --retry 3 --retry-delay 30 \
-            --user-agent "uk-food-pack (github.com/${GITHUB_REPOSITORY})" \
-            -o "$RUNNER_TEMP/products.csv.gz" "$OFF_EXPORT_URL"
-          ls -lh "$RUNNER_TEMP/products.csv.gz"
+          SHA=$(curl --fail --silent --show-error --location --retry 3 --user-agent "$USER_AGENT" "$OFF_DUMP_SHA_URL" \
+                | awk '$2 == "openfoodfacts-mongodbdump.gz" {print $1}')
+          if ! [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]; then echo "No usable SHA-256 published for the dump"; exit 1; fi
+          echo "DUMP_SHA=$SHA" >> "$GITHUB_ENV"
 
-      - name: Work out the safety floor
-        # Refuse to publish if the pack shrinks by more than 20% since last
-        # week (a broken export, a renamed column), with an absolute floor too.
+      - name: Stream the dump into the slim file
+        # Read as it downloads and never stored. extract_dump.py hashes every byte
+        # and deletes its output if the hash doesn't match.
         run: |
-          PREV=$(curl -sfL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/manifest.json" \
-                 | jq -r '.product_count // 0' || echo 0)
-          MIN=$(( PREV * 80 / 100 ))
-          if [ "$MIN" -lt 20000 ]; then MIN=20000; fi
-          echo "previous: $PREV, minimum this run: $MIN"
-          echo "MIN_PRODUCTS=$MIN" >> "$GITHUB_ENV"
+          set -o pipefail
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 30 --user-agent "$USER_AGENT" "$OFF_DUMP_URL" \
+            | python -I scripts/extract_dump.py - --sha256 "$DUMP_SHA" --out "$RUNNER_TEMP/slim.jsonl"
 
-      - name: Build and sign pack
+      - name: Build country packs
+        run: python -I scripts/build_packs.py --slim "$RUNNER_TEMP/slim.jsonl" --source-sha256 "$DUMP_SHA" --out dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-packs
+          path: dist/
+          retention-days: 2
+          if-no-files-found: error
+
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create releases
+      actions: write  # keep the schedule from being switched off after 60 quiet days
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-packs
+          path: dist
+
+      - name: Last week's index and the live UK count
+        run: |
+          curl -sfL "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/index.json" -o previous-index.json || rm -f previous-index.json
+          LIVE=$(curl -sf --retry 3 --retry-delay 20 --user-agent "$USER_AGENT" \
+                  "https://world.openfoodfacts.org/api/v2/search?countries_tags=en:united-kingdom&fields=code&page_size=1" \
+                  | jq -r '.count // empty' || true)
+          echo "live UK count: ${LIVE:-unavailable}"
+          echo "LIVE_UK=${LIVE}" >> "$GITHUB_ENV"
+
+      - name: Check and sign
         env:
           SIGNING_KEY: ${{ secrets.FOOD_PACK_SIGNING_KEY }}
         run: |
           umask 077
           printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/key.pem"
-          python scripts/build_pack.py \
-            --input "$RUNNER_TEMP/products.csv.gz" \
-            --out dist \
-            --min-products "$MIN_PRODUCTS" \
-            --sign-key "$RUNNER_TEMP/key.pem"
+          python3 -I scripts/sign_packs.py --dist dist --key "$RUNNER_TEMP/key.pem" \
+            --previous previous-index.json ${LIVE_UK:+--live-count "$LIVE_UK"} --min-uk 150000
           rm -f "$RUNNER_TEMP/key.pem"
-          openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin \
-            -in dist/uk-food-pack.sqlite.deflate \
-            -sigfile <(jq -r .signature dist/manifest.json | base64 -d)
+          # Prove every signature checks out against the public key the app ships with.
+          for f in index.json $(jq -r '.packs[].file' dist/index.json); do
+            if [ "$f" = index.json ]; then sig=$(cat dist/index.json.sig); else sig=$(jq -r --arg f "$f" '.packs[] | select(.file == $f) | .signature' dist/index.json); fi
+            openssl pkeyutl -verify -pubin -inkey keys/food-pack-public.pem -rawin -in "dist/$f" -sigfile <(echo "$sig" | base64 -d)
+          done
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VERSION=$(jq -r .version dist/manifest.json)
-          COUNT=$(jq -r .product_count dist/manifest.json)
-          TAG="pack-${VERSION}"
+          VERSION=$(jq -r .version dist/index.json)
+          COUNT=$(jq -r '.packs | length' dist/index.json)
+          TAG="packs-${VERSION}"
           gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
-          gh release create "$TAG" \
-            dist/uk-food-pack.sqlite.deflate dist/manifest.json \
-            --title "UK food pack ${VERSION}" \
-            --notes "${COUNT} UK products from Open Food Facts, available under the ODbL 1.0." \
+          gh release create "$TAG" dist/* \
+            --title "World food packs ${VERSION}" \
+            --notes "${COUNT} country packs from the Open Food Facts database dump (SHA-256 $(jq -r .source_sha256 dist/index.json)), available under the ODbL 1.0." \
             --latest
 
       - name: Prune old releases
@@ -88,7 +126,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release list --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("pack-"))] | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' \
+            --jq '[.[] | select(.tagName | startswith("packs-"))] | sort_by(.createdAt) | reverse | .[(env.KEEP_RELEASES | tonumber):] | .[].tagName' \
           | while read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done
 
       - name: Keep schedule alive
