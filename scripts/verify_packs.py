@@ -15,16 +15,18 @@ Checks (any failure stops the release):
     exactly the expected tables and indexes (no views, no triggers), passes
     SQLite's integrity check, and has the counts the index claims;
   - every value is in range: barcodes, text lengths, nutrition, flags;
-  - the reference country (united-kingdom) has at least --min-uk products, at
-    least --min-nutrition of them with nutrition, and at least --min-coverage of
-    the live count from Open Food Facts when that's available;
-  - no large country shrinks by more than 20%, and the reference country's
-    share with nutrition doesn't drop by more than 10 points, against the
-    previous release, which is required unless --first-release is given.
+  - the release is the one worldwide pack ("world"), it has at least
+    --min-products products, and at most 1% of them lack nutrition (only the
+    must-keep products build_packs.py adds whatever their nutrition);
+  - against the previous release, which is required unless --first-release is
+    given, it hasn't shrunk by more than 5%: it must hold at least 95% as many
+    products as any previous pack had with nutrition (the worldwide pack, or
+    during the change from country packs, the biggest country).
+
+Popular products are checked separately, by popular_gate.py.
 
 Usage:
-  verify_packs.py --dist dist (--previous index.json | --first-release)
-                  [--live-count-file live.json] --min-uk N
+  verify_packs.py --dist dist (--previous index.json | --first-release) --min-products N
 """
 
 from __future__ import annotations
@@ -45,10 +47,11 @@ SCHEMA_VERSION = 3
 SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_ASSET = 2 * 1024**3 - 1
-MAX_UNPACKED = 1024**3  # no country comes close; a bigger claim is a red flag
-LARGE_COUNTRY = 5000
-MAX_SHRINK = 0.2
-MAX_NUTRITION_DROP = 0.10
+MAX_UNPACKED = 2_000_000_000  # the worldwide pack was 620 MB in October 2026; a bigger claim is a red flag
+MAX_SHRINK = 0.05
+# Only must-keep products (the watch-list and the most-scanned) may lack nutrition: about 10,000 at most.
+MAX_WITHOUT_NUTRITION = 0.01
+PACK = "world"
 
 INDEX_FIELDS = {
     "schema_version": int, "version": int, "built_at": str, "source": str, "licence": str,
@@ -236,51 +239,24 @@ def check_pack(p: dict, dist: Path) -> list[str]:
             con.close()
 
 
-def gates(index: dict, previous: dict | None, live: int | None, args) -> list[str]:
+def gates(index: dict, previous: dict | None, args) -> list[str]:
     problems = []
     packs = {p["country"]: p for p in index["packs"]}
-    ref = packs.get(args.reference)
-    if ref is None:
-        return [f"no pack for {args.reference}"]
-    count, nut = ref["product_count"], ref["products_with_nutrition"]
-    share = nut / count if count else 0
-    print(f"{args.reference}: {count} products, {share:.0%} with nutrition")
-    if count < args.min_uk:
-        problems.append(f"{args.reference} has only {count} products (minimum {args.min_uk})")
-    if share < args.min_nutrition:
-        problems.append(f"{args.reference}: only {share:.0%} have nutrition (minimum {args.min_nutrition:.0%})")
-    if live:
-        coverage = count / live
-        print(f"{args.reference}: {count} of {live} live products ({coverage:.0%})")
-        if coverage < args.min_coverage:
-            problems.append(f"{args.reference} covers only {coverage:.0%} of Open Food Facts (minimum {args.min_coverage:.0%})")
-    else:
-        # Not silent: GitHub shows this on the run's summary page.
-        print("::warning::Open Food Facts' live count wasn't available, so the coverage gate didn't run this week")
+    if set(packs) != {PACK}:
+        return [f"the release should be the one {PACK} pack, not {sorted(packs)}"]
+    count = packs[PACK]["product_count"]
+    print(f"{PACK}: {count} products")
+    if count < args.min_products:
+        problems.append(f"{PACK} has only {count} products (minimum {args.min_products})")
+    without = count - packs[PACK]["products_with_nutrition"]
+    if without > count * MAX_WITHOUT_NUTRITION:
+        problems.append(f"{PACK}: {without} products have no nutrition (only must-keep products may, at most {MAX_WITHOUT_NUTRITION:.0%})")
     if previous:
         for p in previous.get("packs", []):
-            now = packs.get(p.get("country"))
-            before = p.get("product_count", 0)
-            if before >= LARGE_COUNTRY and (now is None or now["product_count"] < before * (1 - MAX_SHRINK)):
-                problems.append(f"{p.get('country')} shrank from {before} to {now['product_count'] if now else 0}")
-            if p.get("country") == args.reference and before:
-                old_share = p.get("products_with_nutrition", 0) / before
-                if share < old_share - MAX_NUTRITION_DROP:
-                    problems.append(f"{args.reference} nutrition share fell from {old_share:.0%} to {share:.0%}")
+            before = p.get("products_with_nutrition") if isinstance(p, dict) else None
+            if type(before) is int and count < before * (1 - MAX_SHRINK):
+                problems.append(f"{PACK} has {count} products, fewer than {1 - MAX_SHRINK:.0%} of the {before} with nutrition in last week's {p.get('country')} pack")
     return problems
-
-
-def live_count(path: Path | None) -> int | None:
-    """The total from Open Food Facts' search API, if it gave a sensible one."""
-    if path is None or not path.exists():
-        return None
-    try:
-        n = json.loads(path.read_text()).get("count")
-    except (ValueError, AttributeError):
-        return None
-    if isinstance(n, str) and n.isascii() and n.isdigit():
-        n = int(n)
-    return n if type(n) is int and 0 < n < 10**9 else None
 
 
 def main() -> None:
@@ -289,11 +265,7 @@ def main() -> None:
     prev = ap.add_mutually_exclusive_group(required=True)
     prev.add_argument("--previous", type=Path, help="the last published index.json, already signature-checked")
     prev.add_argument("--first-release", action="store_true", help="there is no previous release to compare with")
-    ap.add_argument("--live-count-file", type=Path)
-    ap.add_argument("--reference", default="united-kingdom")
-    ap.add_argument("--min-uk", type=int, required=True)
-    ap.add_argument("--min-coverage", type=float, default=0.8)
-    ap.add_argument("--min-nutrition", type=float, default=0.6)
+    ap.add_argument("--min-products", type=int, required=True)
     args = ap.parse_args()
 
     index_path = args.dist / "index.unsigned.json"
@@ -310,7 +282,7 @@ def main() -> None:
     for p in index["packs"]:
         problems += check_pack(p, args.dist)
     previous = json.loads(args.previous.read_text()) if args.previous else None
-    problems += gates(index, previous, live_count(args.live_count_file), args)
+    problems += gates(index, previous, args)
     if problems:
         sys.exit("Not publishing:\n  " + "\n  ".join(problems))
     print(f"verified {len(index['packs'])} packs")

@@ -1,0 +1,26 @@
+# Products that must always be in the pack, with nutrition. build_packs.py keeps them whatever the week's dump
+# says (carrying last week's nutrition forward if the dump has lost it) and popular_gate.py stops the release if
+# any is missing or has no nutrition. One barcode per line; anything after # is a note.
+#
+# Chosen from products that went wrong in the dump of 28 October 2026 and the most-scanned products in the UK
+# pack of that week. Add a barcode here when a popular product goes missing; only add products that have
+# nutrition on Open Food Facts, or the release will stop.
+90162800        # Red Bull Sugarfree
+5449000000996   # Coca-Cola
+5449000054227   # Coca-Cola Original Taste
+5449000131805   # Coca-Cola Zero Sugar
+5449000131836   # Coca-Cola Zero 500 ml
+5449000214799   # Coke Zero
+3017620425035   # Nutella
+80176800        # Nutella 750 g
+8000500426494   # Nutella Plant-Based
+5000157024671   # Heinz Beanz
+8715700407760   # Heinz Tomato Ketchup
+80761761        # Kinder Bueno White
+3046920028004   # Lindt Excellence 70%
+5060042641000   # Tyrrells Lightly Sea Salted crisps
+5010029229110   # Weetabix Crispy Minis Chocolate Chip
+5000168198491   # McVitie's Digestive Biscuits
+5411188115366   # Alpro Creamy Oat
+3159470000120   # Kellogg's Corn Flakes
+3329770077003   # Yoplait Skyr nature 0%

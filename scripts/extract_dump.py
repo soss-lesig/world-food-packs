@@ -7,7 +7,7 @@ since 2022 (checked October 2026), while the raw database dump has them all.
 The dump is a gzipped `mongodump --archive` (about 16 GB). This reads it as a
 stream, from a file or stdin, hashing the compressed bytes as it goes, and never
 stores it. Only the off.products collection is read. Each product becomes one
-line of JSON with a dozen fields.
+line of JSON with a dozen fields. Country tags aren't read: the pack is worldwide.
 
 Output goes to a temporary name and is only renamed to --out once the whole file
 has been read and, if --sha256 is given, the hash matches. Otherwise the temporary
@@ -240,9 +240,8 @@ def slim(raw: bytes) -> dict | None:
     code = doc.get("code")
     if not isinstance(code, str):
         return None
-    countries = doc.get("countries_tags")
-    if not isinstance(countries, list) or not countries:
-        return None
+    # Country tags are deliberately not read: one worldwide pack, so a product with wrong or missing countries
+    # (as in the dump of 28 October 2026) still gets in.
     nut = doc.get("nutriments") or {}
     out = {
         "code": code.strip(),
@@ -251,7 +250,6 @@ def slim(raw: bytes) -> dict | None:
         "quantity": clean(doc.get("quantity"), 60),
         "serving_size": clean(doc.get("serving_size"), 60),
         "serving_quantity": number(doc.get("serving_quantity")),
-        "countries": [c for c in countries if isinstance(c, str)],
         "scans": whole(doc.get("unique_scans_n")) or whole(doc.get("scans_n")),
         "updated_at": whole(doc.get("last_modified_t")),
         "obsolete": bool(doc.get("obsolete")),

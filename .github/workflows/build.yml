@@ -1,11 +1,12 @@
-name: Build world food packs
+name: Build the worldwide food pack
 
 # Weekly, in four jobs, so the signing key never shares a room with anything
 # downloaded or anything that can write to the repo:
 #
 #   build    no secrets, read-only   streams Open Food Facts' raw database dump (the only
-#                                    source), checks its SHA-256, builds one pack per country
-#   verify   no secrets, read-only   opens every pack and checks it; runs the sanity gates
+#                                    source), checks its SHA-256, builds the one worldwide pack
+#   verify   no secrets, read-only   opens the pack and checks it; runs the sanity gates and the
+#                                    safety check on popular products (popular_gate.py)
 #   sign     the key, nothing else   signs exactly what was verified; no network, no write access
 #   publish  write access, no key    checks every signature, then publishes the release
 #
@@ -26,18 +27,22 @@ concurrency:
 env:
   OFF_DUMP_URL: https://static.openfoodfacts.org/data/openfoodfacts-mongodbdump.gz
   OFF_DUMP_SHA_URL: https://static.openfoodfacts.org/data/gz-sha256sum
-  OFF_LIVE_URL: https://world.openfoodfacts.org/api/v2/search?countries_tags=en:united-kingdom&fields=code&page_size=1
   USER_AGENT: world-food-packs (https://github.com/${{ github.repository }})
   CURL: curl --proto =https --proto-redir =https --fail --silent --show-error --location
   KEEP_RELEASES: 4
-  MIN_UK: 150000
+  # About 3.2 million in October 2026; this only catches a broken build. Week-to-week drops and lost
+  # popular products have their own gates in verify.
+  MIN_PRODUCTS: 2500000
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
-      contents: read
+      contents: read # to read last week's release
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,8 +74,15 @@ jobs:
           $CURL --retry 3 --retry-delay 30 --user-agent "$USER_AGENT" "$OFF_DUMP_URL" \
             | python -I scripts/extract_dump.py - --sha256 "$DUMP_SHA" --out "$RUNNER_TEMP/slim.jsonl"
 
-      - name: Build country packs
-        run: python -I scripts/build_packs.py --slim "$RUNNER_TEMP/slim.jsonl" --source-sha256 "$DUMP_SHA" --out dist
+      - name: Last week's release, signature checked
+        # The build carries last week's popular products and nutrition forward when this week's dump has lost them.
+        run: scripts/fetch_previous.sh
+
+      - name: Build the worldwide pack
+        run: |
+          read -ra previous <<< "$PREVIOUS_PACK"
+          python -I scripts/build_packs.py --slim "$RUNNER_TEMP/slim.jsonl" --source-sha256 "$DUMP_SHA" --out dist \
+            --watchlist popular-watchlist.txt "${previous[@]}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -106,35 +118,20 @@ jobs:
           name: unsigned-packs
           path: dist
 
-      - name: Last week's index, signature checked
-        # Required whenever a release exists, so the shrink gates can't be skipped
-        # just because the download failed.
+      - name: Last week's release, signature checked
+        run: scripts/fetch_previous.sh
+
+      - name: Verify the pack and run the gates
         run: |
-          TAG=$(gh release list --limit 100 --json tagName,createdAt \
-                --jq '[.[] | select(.tagName | startswith("packs-"))] | sort_by(.createdAt) | last | .tagName // empty')
-          if [ -z "$TAG" ]; then
-            echo "No previous packs release: this is the first."
-            echo "PREVIOUS=--first-release" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          gh release download "$TAG" --pattern index.json --pattern index.json.sig --dir previous
-          base64 -d previous/index.json.sig > previous/index.sig.bin
-          # The current key, or during a key change the one before it (keys/previous-public.pem).
-          ok=no
-          for key in keys/food-pack-public.pem keys/previous-public.pem; do
-            [ -f "$key" ] || continue
-            if openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in previous/index.json -sigfile previous/index.sig.bin; then ok=yes; break; fi
-          done
-          [ "$ok" = yes ] || { echo "Last week's index doesn't verify with the current or previous key"; exit 1; }
-          echo "PREVIOUS=--previous previous/index.json" >> "$GITHUB_ENV"
+          read -ra previous <<< "$PREVIOUS"
+          python -I scripts/verify_packs.py --dist dist "${previous[@]}" --min-products "$MIN_PRODUCTS"
 
-      - name: Open Food Facts' live UK count
-        # Saved as a file and read by Python, which only accepts a plain number.
-        # If their search is down, verify_packs.py warns and the other gates still run.
-        run: $CURL --retry 3 --retry-delay 20 --user-agent "$USER_AGENT" "$OFF_LIVE_URL" -o live.json || rm -f live.json
-
-      - name: Verify every pack and run the gates
-        run: python -I scripts/verify_packs.py --dist dist $PREVIOUS --live-count-file live.json --min-uk "$MIN_UK"
+      - name: Safety check on popular products
+        # Refuses the release if any watch-list product, or any of last week's 5,000 most-scanned products, is
+        # missing or has lost its nutrition. See the README.
+        run: |
+          read -ra previous <<< "$PREVIOUS_PACK"
+          python -I scripts/popular_gate.py --dist dist --watchlist popular-watchlist.txt "${previous[@]}"
 
       - name: Pin what passed
         id: pin
@@ -215,13 +212,13 @@ jobs:
         run: |
           VERSION=$(sed -n 's/^version=\([0-9]\{8\}\)$/\1/p' stage.log)
           [ -n "$VERSION" ] || { echo "no version"; exit 1; }
-          COUNT=$(find release -name '*.sqlite.deflate' | wc -l)
+          COUNT=$(python3 -I -c 'import json; print(json.load(open("release/index.json"))["packs"][0]["product_count"])')
           SOURCE=$(python3 -I -c 'import json; print(json.load(open("release/index.json"))["source_sha256"])')
           TAG="packs-${VERSION}"
           gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
           gh release create "$TAG" release/* \
-            --title "World food packs ${VERSION}" \
-            --notes "${COUNT} country packs from the Open Food Facts database dump (SHA-256 ${SOURCE}), available under the ODbL 1.0." \
+            --title "Worldwide food pack ${VERSION}" \
+            --notes "One worldwide pack of ${COUNT} products, from the Open Food Facts database dump (SHA-256 ${SOURCE}), available under the ODbL 1.0." \
             --latest
 
       - name: Prune old releases
